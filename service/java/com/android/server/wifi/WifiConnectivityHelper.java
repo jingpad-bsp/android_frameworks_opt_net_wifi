@@ -94,7 +94,7 @@ public class WifiConnectivityHelper {
      * Return if firmware roaming is supported.
      */
     public boolean isFirmwareRoamingSupported() {
-        return mFirmwareRoamingSupported;
+        return true;
     }
 
     /**
@@ -171,5 +171,12 @@ public class WifiConnectivityHelper {
      */
     public void removeNetworkIfCurrent(int networkId) {
         mWifiNative.removeNetworkIfCurrent(mWifiNative.getClientInterfaceName(), networkId);
+    }
+
+    /**
+    * Tell driver to start offload roaming.
+    */
+    public void enableFirmwareRoaming() {
+        mWifiNative.enableFirmwareRoaming(mWifiNative.getClientInterfaceName() ,WifiNative.ENABLE_FIRMWARE_ROAMING);
     }
 }

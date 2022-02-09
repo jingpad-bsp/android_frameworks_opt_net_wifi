@@ -16,7 +16,7 @@
 package com.android.server.wifi;
 
 import android.content.Context;
-import android.hardware.wifi.supplicant.V1_0.ISupplicantStaNetwork;
+//import android.hardware.wifi.supplicant.V1_0.ISupplicantStaNetwork;
 import android.hardware.wifi.supplicant.V1_0.ISupplicantStaNetworkCallback;
 import android.hardware.wifi.supplicant.V1_0.SupplicantStatus;
 import android.hardware.wifi.supplicant.V1_0.SupplicantStatusCode;
@@ -49,6 +49,8 @@ import java.util.regex.Pattern;
 
 import javax.annotation.concurrent.ThreadSafe;
 
+import vendor.sprd.hardware.wifi.supplicant.V1_2.ISupplicantStaNetwork;
+
 
 /**
  * Wrapper class for ISupplicantStaNetwork HAL calls. Gets and sets supplicant sta network variables
@@ -59,8 +61,8 @@ import javax.annotation.concurrent.ThreadSafe;
  * access level) acquires mLock.
  */
 @ThreadSafe
-public class SupplicantStaNetworkHal {
-    private static final String TAG = "SupplicantStaNetworkHal";
+public class SupplicantStaNetworkHalEx {
+    private static final String TAG = "SupplicantStaNetworkHalEx";
     @VisibleForTesting
     public static final String ID_STRING_KEY_FQDN = "fqdn";
     @VisibleForTesting
@@ -131,7 +133,9 @@ public class SupplicantStaNetworkHal {
     private String mEapEngineID;
     private String mEapDomainSuffixMatch;
 
-    SupplicantStaNetworkHal(ISupplicantStaNetwork iSupplicantStaNetwork, String ifaceName,
+    private String paramValue;
+
+    SupplicantStaNetworkHalEx(ISupplicantStaNetwork iSupplicantStaNetwork, String ifaceName,
             Context context, WifiMonitor monitor) {
         mISupplicantStaNetwork = iSupplicantStaNetwork;
         mIfaceName = ifaceName;
@@ -257,6 +261,7 @@ public class SupplicantStaNetworkHal {
         }
     }
 
+
     /**
      * Save an entire WifiConfiguration to wpa_supplicant via HIDL.
      *
@@ -317,7 +322,8 @@ public class SupplicantStaNetworkHal {
             boolean hasSetKey = false;
             if (config.wepKeys != null) {
                 for (int i = 0; i < config.wepKeys.length; i++) {
-                    if (config.wepKeys[i] != null) {
+                    // SPRD:Add for bug788201 Cannot connect to the wep ap who changes its pwd index
+                    if (config.wepTxKeyIndex == i && config.wepKeys[i] != null) {
                         if (!setWepKey(
                                 i, NativeUtil.hexOrQuotedStringToBytes(config.wepKeys[i]))) {
                             Log.e(TAG, "failed to set wep_key " + i);
@@ -339,11 +345,19 @@ public class SupplicantStaNetworkHal {
                 Log.e(TAG, config.SSID + ": failed to set hiddenSSID: " + config.hiddenSSID);
                 return false;
             }
-
+            // The logic below is skipping WPA2-Enterprise explicit setting of PMF to disabled
+            // in order to allow connection to networks with PMF required. Skipping means that
+            // wpa_supplicant will use the global setting (optional/capable).
+            // TODO(b/130755779): A permanent fix should convert requirePMF to a tri-state variablbe
+            boolean wpa2EnterpriseSkipPmf = !config.requirePMF
+                    && (config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_EAP)
+                    || config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.IEEE8021X));
             /** RequirePMF */
-            if (!setRequirePmf(config.requirePMF)) {
-                Log.e(TAG, config.SSID + ": failed to set requirePMF: " + config.requirePMF);
-                return false;
+            if (!wpa2EnterpriseSkipPmf) {
+                if (!setRequirePmf(config.requirePMF)) {
+                    Log.e(TAG, config.SSID + ": failed to set requirePMF: " + config.requirePMF);
+                    return false;
+                }
             }
             /** Key Management Scheme */
             if (config.allowedKeyManagement.cardinality() != 0) {
@@ -361,6 +375,15 @@ public class SupplicantStaNetworkHal {
                         && !saveSuiteBConfig(config)) {
                     Log.e(TAG, "Failed to set Suite-B-192 configuration");
                     return false;
+                }
+
+                //Add for wapi support
+                if (config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WAPI_PSK)) {
+                    setNetworkParam(WifiConfiguration.wapiPskTypeVarName, Integer.toString(config.wapiPskType));
+                }
+                if (config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WAPI_CERT)) {
+                    setNetworkParam(WifiConfiguration.wapiAsCertVarName, config.wapiAsCert);
+                    setNetworkParam(WifiConfiguration.wapiUserCertVarName, config.wapiUserCert);
                 }
             }
             /** Security Protocol */
@@ -530,6 +553,10 @@ public class SupplicantStaNetworkHal {
             if (getEapCAPath() && !TextUtils.isEmpty(mEapCAPath)) {
                 eapConfig.setFieldValue(WifiEnterpriseConfig.CA_PATH_KEY, mEapCAPath);
             }
+            /** Eap Sim Num*/
+            if (getNetworkParam(WifiEnterpriseConfig.SIM_NUM_KEY)) {
+                eapConfig.setSimNum(Integer.parseInt(paramValue));
+            }
             return true;
         }
     }
@@ -686,6 +713,11 @@ public class SupplicantStaNetworkHal {
                 return false;
             }
 
+            /** EAP Sim Num */
+            if (!setNetworkParam(WifiEnterpriseConfig.SIM_NUM_KEY, Integer.toString(eapConfig.getSimNum()))) {
+                Log.e(TAG, ssid + ": failed to set proactive sim num: " + eapConfig.getSimNum());
+                return false;
+            }
             return true;
         }
     }
@@ -749,6 +781,12 @@ public class SupplicantStaNetworkHal {
                     mask |= android.hardware.wifi.supplicant.V1_2.ISupplicantStaNetwork.KeyMgmtMask
                             .WPA_EAP_SHA256;
                     break;
+                case WifiConfiguration.KeyMgmt.WAPI_PSK:
+                    mask |= ISupplicantStaNetwork.KeyMgmtMaskEx.WAPI_PSK;
+                    break;
+                case WifiConfiguration.KeyMgmt.WAPI_CERT:
+                    mask |= ISupplicantStaNetwork.KeyMgmtMaskEx.WAPI_CERT;
+                    break;
                 case WifiConfiguration.KeyMgmt.WPA2_PSK: // This should never happen
                 default:
                     throw new IllegalArgumentException(
@@ -771,6 +809,9 @@ public class SupplicantStaNetworkHal {
                     break;
                 case WifiConfiguration.Protocol.OSEN:
                     mask |= ISupplicantStaNetwork.ProtoMask.OSEN;
+                    break;
+                case WifiConfiguration.Protocol.WAPI:
+                    mask |= ISupplicantStaNetwork.ProtoMaskEx.WAPI;
                     break;
                 default:
                     throw new IllegalArgumentException(
@@ -982,6 +1023,12 @@ public class SupplicantStaNetworkHal {
         mask = supplicantMaskValueToWifiConfigurationBitSet(
                 mask, android.hardware.wifi.supplicant.V1_2.ISupplicantStaNetwork.KeyMgmtMask
                         .WPA_EAP_SHA256, bitset, WifiConfiguration.KeyMgmt.WPA_EAP_SHA256);
+        mask = supplicantMaskValueToWifiConfigurationBitSet(
+                mask, ISupplicantStaNetwork.KeyMgmtMaskEx.WAPI_PSK, bitset,
+                WifiConfiguration.KeyMgmt.WAPI_PSK);
+        mask = supplicantMaskValueToWifiConfigurationBitSet(
+                mask, ISupplicantStaNetwork.KeyMgmtMaskEx.WAPI_CERT, bitset,
+                WifiConfiguration.KeyMgmt.WAPI_CERT);
         if (mask != 0) {
             throw new IllegalArgumentException(
                     "invalid key mgmt mask from supplicant: " + mask);
@@ -1000,6 +1047,9 @@ public class SupplicantStaNetworkHal {
         mask = supplicantMaskValueToWifiConfigurationBitSet(
                 mask, ISupplicantStaNetwork.ProtoMask.OSEN, bitset,
                 WifiConfiguration.Protocol.OSEN);
+        mask = supplicantMaskValueToWifiConfigurationBitSet(
+                mask, ISupplicantStaNetwork.ProtoMaskEx.WAPI, bitset,
+                WifiConfiguration.Protocol.WAPI);
         if (mask != 0) {
             throw new IllegalArgumentException(
                     "invalid proto mask from supplicant: " + mask);
@@ -3004,14 +3054,6 @@ public class SupplicantStaNetworkHal {
     private BitSet addSha256KeyMgmtFlags(BitSet keyManagementFlags) {
         synchronized (mLock) {
             BitSet modifiedFlags = (BitSet) keyManagementFlags.clone();
-            android.hardware.wifi.supplicant.V1_2.ISupplicantStaNetwork
-                    iSupplicantStaNetworkV12;
-            iSupplicantStaNetworkV12 = getV1_2StaNetwork();
-            if (iSupplicantStaNetworkV12 == null) {
-                // SHA256 key management requires HALv1.2 or higher
-                return modifiedFlags;
-            }
-
             if (keyManagementFlags.get(WifiConfiguration.KeyMgmt.WPA_PSK)) {
                 modifiedFlags.set(WifiConfiguration.KeyMgmt.WPA_PSK_SHA256);
             }
@@ -3137,4 +3179,41 @@ public class SupplicantStaNetworkHal {
             }
         }
     }
+
+    private boolean setNetworkParam(String key, String value) {
+        synchronized (mLock) {
+            final String methodStr = "setNetworkParam";
+            if (!checkISupplicantStaNetworkAndLogFailure(methodStr)) return false;
+            Log.d(TAG, "setNetworkParam " + key + ", " + value);
+            if (value == null) return false;
+            try {
+                SupplicantStatus status =  mISupplicantStaNetwork.setNetworkParam(key, NativeUtil.removeEnclosingQuotes(value));
+                return checkStatusAndLogFailure(status, methodStr);
+            } catch (RemoteException e) {
+                return false;
+            }
+        }
+    }
+
+    private boolean getNetworkParam(String key) {
+        synchronized (mLock) {
+            final String methodStr = "getNetworkParam";
+            if (!checkISupplicantStaNetworkAndLogFailure(methodStr)) return false;
+            try {
+                MutableBoolean statusOk = new MutableBoolean(false);
+                mISupplicantStaNetwork.getNetworkParam(key, (SupplicantStatus status, String value) -> {
+                    statusOk.value = status.code == SupplicantStatusCode.SUCCESS;
+                    if (statusOk.value) {
+                        this.paramValue = value;
+                    } else {
+                        checkStatusAndLogFailure(status, methodStr);
+                    }
+                });
+                return statusOk.value;
+            } catch (RemoteException e) {
+                return false;
+            }
+        }
+    }
+
 }
